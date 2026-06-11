@@ -1,0 +1,255 @@
+name: PR Review
+description: 'LLM-powered pull request review. Supports Anthropic, OpenAI, and any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio, OpenRouter, etc.).'
+
+inputs:
+  provider:
+    description: "LLM provider: 'anthropic', 'openai', or 'openai-compatible' (local/self-hosted endpoints)."
+    required: false
+    default: "anthropic"
+  base-url:
+    description: "API base URL override. Defaults: anthropic=https://api.anthropic.com, openai=https://api.openai.com/v1. Required for 'openai-compatible' (e.g. http://localhost:11434/v1 for Ollama)."
+    required: false
+    default: ""
+  model:
+    description: "Model ID, e.g. 'claude-opus-4-8' (anthropic) or 'llama3.1:70b' (Ollama)."
+    required: false
+    default: "claude-opus-4-8"
+  api-key:
+    description: "API key for the provider. Required for cloud providers; optional for local openai-compatible endpoints."
+    required: false
+    default: ""
+  github-token:
+    description: "Token used to read the PR diff and post the review comment."
+    required: false
+    default: ${{ github.token }}
+  pr-number:
+    description: "Pull request number. Defaults to the PR from the triggering event."
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  max-tokens:
+    description: "Maximum output tokens for the review."
+    required: false
+    default: "16000"
+  max-diff-bytes:
+    description: "Truncate the PR diff beyond this many bytes before sending to the LLM."
+    required: false
+    default: "300000"
+  review-prompt:
+    description: "Override the default system prompt used for the review."
+    required: false
+    default: ""
+  post-comment:
+    description: "Post the review as a sticky PR comment ('true'/'false'). The comment is updated in place on subsequent runs."
+    required: false
+    default: "true"
+
+outputs:
+  review:
+    description: "The generated review body (markdown)."
+    value: ${{ steps.review.outputs.review }}
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        BASE_URL: ${{ inputs.base-url }}
+        API_KEY: ${{ inputs.api-key }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        if [[ -z "$PR_NUMBER" ]]; then
+          echo "::error::No pull request number found. Run on a pull_request event or set the 'pr-number' input."
+          exit 1
+        fi
+        case "$PROVIDER" in
+          anthropic|openai)
+            if [[ -z "$API_KEY" ]]; then
+              echo "::error::'api-key' is required for provider '$PROVIDER'."
+              exit 1
+            fi
+            ;;
+          openai-compatible)
+            if [[ -z "$BASE_URL" ]]; then
+              echo "::error::'base-url' is required for provider 'openai-compatible' (e.g. http://localhost:11434/v1)."
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::Unknown provider '$PROVIDER'. Use 'anthropic', 'openai', or 'openai-compatible'."
+            exit 1
+            ;;
+        esac
+
+    - name: Fetch PR metadata and diff
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+      run: |
+        gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body \
+          --template '# {{.title}}{{"\n\n"}}{{.body}}' > "$RUNNER_TEMP/pr-description.md"
+
+        gh pr diff "$PR_NUMBER" --repo "$REPO" > "$RUNNER_TEMP/pr.diff"
+
+        diff_size=$(wc -c < "$RUNNER_TEMP/pr.diff")
+        if (( diff_size > MAX_DIFF_BYTES )); then
+          echo "::warning::PR diff is ${diff_size} bytes; truncating to ${MAX_DIFF_BYTES} bytes."
+          head -c "$MAX_DIFF_BYTES" "$RUNNER_TEMP/pr.diff" > "$RUNNER_TEMP/pr.diff.tmp"
+          printf '\n\n[diff truncated at %s bytes]\n' "$MAX_DIFF_BYTES" >> "$RUNNER_TEMP/pr.diff.tmp"
+          mv "$RUNNER_TEMP/pr.diff.tmp" "$RUNNER_TEMP/pr.diff"
+        fi
+
+    - name: Build prompts
+      shell: bash
+      env:
+        REVIEW_PROMPT: ${{ inputs.review-prompt }}
+      run: |
+        if [[ -n "$REVIEW_PROMPT" ]]; then
+          printf '%s' "$REVIEW_PROMPT" > "$RUNNER_TEMP/system.md"
+        else
+          cat > "$RUNNER_TEMP/system.md" <<'SYSTEM_EOF'
+        You are an expert code reviewer. Review the pull request diff and respond in GitHub-flavored markdown with the following sections:
+
+        ## Summary
+        One short paragraph describing what the change does.
+
+        ## Findings
+        Concrete issues found, ordered by severity (bugs, security issues, race conditions, error-handling gaps, breaking changes). For each finding reference the file and hunk, explain the problem, and suggest a fix. If there are no significant findings, say so explicitly.
+
+        ## Suggestions
+        Optional, lower-severity improvements (readability, naming, tests, docs). Keep this brief.
+
+        Rules:
+        - Only comment on the changed code in the diff; do not speculate about code you cannot see.
+        - Report every issue you find, including ones you are uncertain about — mark uncertain findings as such.
+        - Do not pad the review with praise or restate the diff.
+        SYSTEM_EOF
+        fi
+
+        {
+          cat "$RUNNER_TEMP/pr-description.md"
+          printf '\n\n## Diff\n\n```diff\n'
+          cat "$RUNNER_TEMP/pr.diff"
+          printf '\n```\n'
+        } > "$RUNNER_TEMP/user.md"
+
+    - name: Generate review
+      id: review
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        BASE_URL: ${{ inputs.base-url }}
+        MODEL: ${{ inputs.model }}
+        API_KEY: ${{ inputs.api-key }}
+        MAX_TOKENS: ${{ inputs.max-tokens }}
+      run: |
+        payload="$RUNNER_TEMP/payload.json"
+        response="$RUNNER_TEMP/response.json"
+        review_file="$RUNNER_TEMP/review.md"
+
+        case "$PROVIDER" in
+          anthropic)
+            url="${BASE_URL:-https://api.anthropic.com}"
+            url="${url%/}/v1/messages"
+            jq -n \
+              --arg model "$MODEL" \
+              --argjson max_tokens "$MAX_TOKENS" \
+              --rawfile system "$RUNNER_TEMP/system.md" \
+              --rawfile prompt "$RUNNER_TEMP/user.md" \
+              '{model: $model, max_tokens: $max_tokens, system: $system,
+                messages: [{role: "user", content: $prompt}]}' > "$payload"
+            http_code=$(curl -sS -o "$response" -w '%{http_code}' \
+              --retry 2 --retry-delay 5 \
+              -X POST "$url" \
+              -H "content-type: application/json" \
+              -H "x-api-key: $API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -d @"$payload")
+            ;;
+          openai|openai-compatible)
+            if [[ "$PROVIDER" == "openai" ]]; then
+              url="${BASE_URL:-https://api.openai.com/v1}"
+            else
+              url="$BASE_URL"
+            fi
+            url="${url%/}/chat/completions"
+            jq -n \
+              --arg model "$MODEL" \
+              --argjson max_tokens "$MAX_TOKENS" \
+              --rawfile system "$RUNNER_TEMP/system.md" \
+              --rawfile prompt "$RUNNER_TEMP/user.md" \
+              '{model: $model, max_tokens: $max_tokens,
+                messages: [{role: "system", content: $system},
+                           {role: "user", content: $prompt}]}' > "$payload"
+            auth_args=()
+            if [[ -n "$API_KEY" ]]; then
+              auth_args=(-H "Authorization: Bearer $API_KEY")
+            fi
+            http_code=$(curl -sS -o "$response" -w '%{http_code}' \
+              --retry 2 --retry-delay 5 \
+              -X POST "$url" \
+              -H "content-type: application/json" \
+              "${auth_args[@]}" \
+              -d @"$payload")
+            ;;
+        esac
+
+        if [[ "$http_code" != "200" ]]; then
+          echo "::error::LLM request to $url failed with HTTP $http_code"
+          cat "$response"
+          exit 1
+        fi
+
+        if [[ "$PROVIDER" == "anthropic" ]]; then
+          jq -r '[.content[] | select(.type == "text") | .text] | join("\n")' "$response" > "$review_file"
+        else
+          jq -r '.choices[0].message.content // empty' "$response" > "$review_file"
+        fi
+
+        if [[ ! -s "$review_file" ]]; then
+          echo "::error::LLM response contained no review text."
+          cat "$response"
+          exit 1
+        fi
+
+        {
+          echo "review<<PR_REVIEW_EOF"
+          cat "$review_file"
+          echo ""
+          echo "PR_REVIEW_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Post sticky PR comment
+      if: inputs.post-comment == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        marker="<!-- pr-review-action -->"
+        body_file="$RUNNER_TEMP/comment.json"
+
+        {
+          printf '%s\n\n' "$marker"
+          cat "$RUNNER_TEMP/review.md"
+          printf '\n\n---\n_Generated by `pr-review` (%s / %s)_\n' "$PROVIDER" "$MODEL"
+        } | jq -Rs '{body: .}' > "$body_file"
+
+        comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
+
+        if [[ -n "$comment_id" ]]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" --input "$body_file" > /dev/null
+          echo "Updated existing review comment $comment_id"
+        else
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input "$body_file" > /dev/null
+          echo "Created new review comment"
+        fi

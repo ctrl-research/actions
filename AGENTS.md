@@ -14,6 +14,50 @@ Agents should prioritize:
 
 ---
 
+# Repository Guide
+
+## Purpose
+
+Org-level collection of reusable GitHub Actions for the `ctrl-research` org. Two kinds of artifacts:
+
+- **Composite actions**: each top-level directory is one action, consumed as `ctrl-research/actions/<dir>@<ref>` (e.g. `pr-review/action.yaml`)
+- **Reusable workflows**: `.github/workflows/*.yaml` with `on: workflow_call`, consumed as `ctrl-research/actions/.github/workflows/<name>.yaml@<ref>`
+
+There is no application code, build step, or test suite — everything is YAML + bash steps using preinstalled runner tools (`gh`, `jq`, `curl`).
+
+## Validation
+
+CI (`.github/workflows/ci.yml`) only checks YAML parseability and greps for committed secrets. Validate locally before pushing:
+
+```bash
+# YAML syntax (what CI does)
+python3 -c "import yaml; yaml.safe_load(open('pr-review/action.yaml'))"
+
+# Workflow lint (if installed)
+actionlint .github/workflows/pr-review.yaml
+```
+
+Note: the CI YAML check only `echo`s on invalid YAML — it does not fail the job. Don't rely on CI to catch syntax errors.
+
+## Architecture: pr-review
+
+The `pr-review` action is the main artifact and exists at two layers that must stay in sync:
+
+- `pr-review/action.yaml` — composite action. Pure bash/gh/jq/curl pipeline: validate inputs → fetch PR diff via `gh pr diff` (no checkout needed) → build prompts → call the LLM → post a sticky PR comment (identified by the `<!-- pr-review-action -->` marker, updated in place on re-runs).
+- `.github/workflows/pr-review.yaml` — reusable workflow wrapper that maps `workflow_call` inputs/secrets onto the composite action.
+
+Provider abstraction: `anthropic` (Messages API, `x-api-key` + `anthropic-version` headers, response text at `.content[] | select(.type=="text")`) vs `openai`/`openai-compatible` (Chat Completions, `Authorization: Bearer`, response at `.choices[0].message.content`). Local endpoints (Ollama/vLLM) use `openai-compatible` with a required `base-url` and optional key. When adding inputs, update both layers and the inputs table in `pr-review/README.md`.
+
+## Repo Conventions
+
+- Action files are named `action.yaml` (not `action.yml`); all use `runs.using: composite`; every step needs `shell: bash`
+- Inputs are kebab-case; secrets are passed to composite actions as inputs (composite actions cannot read `secrets` directly)
+- Pass untrusted values (PR titles, inputs) to bash via `env:` blocks, never inline `${{ }}` interpolation in `run:`
+- Pin third-party actions to exact versions (e.g. `actions/checkout@v4.2.2`); Renovate manages bumps (`github-actions` manager enabled)
+- Conventional commits (`feat`, `fix`, `chore`, `docs`, `ci`, ...); branches named `feat|bug|hotfix|release|chore/brief-description` (see CONTRIBUTING.md)
+
+---
+
 # Repository Principles
 
 ## Core Rules
@@ -169,20 +213,18 @@ Relevant docs may include:
 
 ## Repository Structure
 
-> This section is intentionally lightweight in the template repository.
-> Projects should customize it as the architecture evolves.
-
 ```text
 /
-├── src/                # Application source code
-├── tests/              # Automated tests
-├── docs/               # Project documentation
-├── scripts/            # Utility and automation scripts
-├── config/             # Configuration files/templates
-├── examples/           # Example usage or sample apps
-├── assets/             # Static assets
-├── .github/            # CI/CD and GitHub workflows
-└── README.md           # Project overview and setup
+├── pr-review/              # Composite action: LLM-powered PR review (action.yaml + README.md)
+├── .github/
+│   ├── workflows/
+│   │   ├── pr-review.yaml  # Reusable workflow wrapper for pr-review
+│   │   ├── renovate.yaml   # Self-hosted Renovate runner
+│   │   └── ci.yml          # YAML validation + secret scan
+│   ├── renovate-config.js  # Renovate runtime config
+│   └── CODEOWNERS
+├── renovate.json           # Renovate dependency rules
+└── AGENTS.md               # This file
 ```
 
 ## Commit Style
