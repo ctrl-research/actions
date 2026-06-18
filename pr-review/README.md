@@ -2,7 +2,16 @@
 
 LLM-powered pull request review. Fetches the PR diff, sends it to a configurable LLM provider, and posts the review as a sticky PR comment (updated in place on subsequent pushes).
 
-Supported providers:
+Works on **GitHub** (github.com, GitHub Enterprise Server) and **Forgejo/Gitea** Actions runners — both run this composite-action format and expose a GitHub-shaped REST API. Select with the `platform` input.
+
+Supported forges:
+
+| `platform` | API | Token header |
+|---|---|---|
+| `github` | GitHub REST API (`github.api_url`, e.g. `https://api.github.com`) | `Authorization: Bearer` |
+| `forgejo` | Forgejo/Gitea API (e.g. `https://codeberg.org/api/v1`) | `Authorization: token` |
+
+Supported LLM providers:
 
 | `provider` | Endpoint | Auth |
 |---|---|---|
@@ -10,7 +19,7 @@ Supported providers:
 | `openai` | OpenAI Chat Completions (`/chat/completions`) | `api-key` required |
 | `openai-compatible` | Any OpenAI-compatible server — Ollama, vLLM, LM Studio, OpenRouter, LiteLLM, etc. | `api-key` optional; `base-url` required |
 
-No checkout step is needed — the action reads the diff via the GitHub API.
+No checkout step is needed — the action reads the diff via the forge REST API.
 
 ## Usage — reusable workflow
 
@@ -62,6 +71,30 @@ jobs:
       llm-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+### Forgejo / Gitea
+
+The same composite action runs on a Forgejo Actions runner. Set `platform: forgejo`; `api-url` defaults to the instance API, and the job token reads the PR and posts the comment. Provide the LLM key via an Actions secret:
+
+```yaml
+# .forgejo/workflows/pr-review.yaml in your repo
+on:
+  pull_request:
+
+jobs:
+  review:
+    runs-on: docker
+    steps:
+      - name: PR Review
+        uses: https://github.com/ctrl-research/actions/pr-review@main
+        with:
+          platform: forgejo
+          provider: anthropic
+          model: claude-opus-4-8
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+Pair it with a local LLM (`provider: openai-compatible`, `base-url: ...`) to keep the diff entirely on your own infrastructure.
+
 ## Usage — composite action
 
 For more control (custom prompt, consuming the review output in later steps):
@@ -91,11 +124,13 @@ jobs:
 
 | Input | Default | Description |
 |---|---|---|
+| `platform` | `github` | Forge hosting the PR: `github` or `forgejo` (also covers Gitea) |
+| `api-url` | `github.api_url` | Forge REST API base URL. Override for self-hosted instances |
 | `provider` | `anthropic` | `anthropic`, `openai`, or `openai-compatible` |
-| `base-url` | provider default | API base URL. Required for `openai-compatible` |
+| `base-url` | provider default | LLM API base URL. Required for `openai-compatible` |
 | `model` | `claude-opus-4-8` | Model ID |
-| `api-key` | — | Provider API key (pass from a secret) |
-| `github-token` | `github.token` | Token for reading the diff and posting the comment |
+| `api-key` | — | LLM provider API key (pass from a secret) |
+| `github-token` | `github.token` | Forge token for reading the diff and posting the comment |
 | `pr-number` | from event | PR number when not running on a `pull_request` event |
 | `max-tokens` | `16000` | Max output tokens |
 | `max-diff-bytes` | `300000` | Diff truncation limit |
@@ -110,6 +145,14 @@ jobs:
 
 ## Notes
 
+- Requires `curl` and `jq` on the runner (both are present on GitHub-hosted runners; ensure your Forgejo runner image includes them).
 - The sticky comment is identified by an HTML marker (`<!-- pr-review-action -->`); re-runs update it instead of stacking new comments.
 - Diffs larger than `max-diff-bytes` are truncated with a notice appended, so the model knows the diff is partial.
 - The `openai`/`openai-compatible` path sends `max_tokens`; some newer OpenAI models require `max_completion_tokens` instead — prefer broadly-compatible models or a proxy (LiteLLM) if you hit that.
+
+## Security
+
+- **Trigger with `pull_request`, not `pull_request_target`.** On `pull_request`, PRs from forks get a read-only token and no secrets — so for fork PRs this action simply no-ops (it cannot post). That is the safe default. `pull_request_target` runs with your secrets and a write token in the context of an untrusted PR; do not use it here.
+- **The PR title, body, and diff are untrusted, attacker-controlled input** that is fed to the LLM. The review comment is therefore attacker-influenceable: a malicious PR can attempt prompt injection to skew the review or embed misleading links. The system prompt instructs the model to treat PR content as data, but treat the generated review as advisory, not authoritative. Keep a human in the loop for merge decisions.
+- The LLM endpoint (`base-url`) receives the full diff. Point it only at an endpoint you trust; use `provider: openai-compatible` with a self-hosted model to keep code on your own infrastructure.
+- Secrets (LLM API key, forge token) are passed to `curl` via 0600 config files rather than the command line, so they do not appear in the runner's process list. The forge token is never sent across HTTP redirects.
