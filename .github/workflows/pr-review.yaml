@@ -4,6 +4,16 @@ run-name: LLM PR review for ${{ github.event.pull_request.title || github.ref_na
 on:
   workflow_call:
     inputs:
+      platform:
+        type: string
+        required: false
+        default: "github"
+        description: "Forge hosting the PR: 'github' or 'forgejo' (also covers Gitea)."
+      api-url:
+        type: string
+        required: false
+        default: ""
+        description: "Forge REST API base URL. Leave empty to use this forge's API; override for self-hosted instances (e.g. https://codeberg.org/api/v1)."
       provider:
         type: string
         required: false
@@ -61,6 +71,8 @@ jobs:
       - name: PR Review
         uses: ctrl-research/actions/pr-review@main
         with:
+          platform: ${{ inputs.platform }}
+          api-url: ${{ inputs.api-url || github.api_url }}
           provider: ${{ inputs.provider }}
           base-url: ${{ inputs.base-url }}
           model: ${{ inputs.model }}
