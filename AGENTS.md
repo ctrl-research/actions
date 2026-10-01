@@ -20,7 +20,7 @@ Agents should prioritize:
 
 Org-level collection of reusable GitHub Actions for the `ctrl-research` org. Two kinds of artifacts:
 
-- **Composite actions**: each top-level directory is one action, consumed as `ctrl-research/actions/<dir>@<ref>` (e.g. `pr-review/action.yaml`)
+- **Composite actions**: each top-level directory is one action, consumed as `ctrl-research/actions/<dir>@<ref>` (e.g. `<dir>/action.yaml`)
 - **Reusable workflows**: `.github/workflows/*.yaml` with `on: workflow_call`, consumed as `ctrl-research/actions/.github/workflows/<name>.yaml@<ref>`
 
 There is no application code, build step, or test suite — everything is YAML + bash steps using preinstalled runner tools (`gh`, `jq`, `curl`).
@@ -31,22 +31,17 @@ CI (`.github/workflows/ci.yml`) only checks YAML parseability and greps for comm
 
 ```bash
 # YAML syntax (what CI does)
-python3 -c "import yaml; yaml.safe_load(open('pr-review/action.yaml'))"
+python3 -c "import yaml; yaml.safe_load(open('<dir>/action.yaml'))"
 
 # Workflow lint (if installed)
-actionlint .github/workflows/pr-review.yaml
+actionlint
 ```
 
 Note: the CI YAML check only `echo`s on invalid YAML — it does not fail the job. Don't rely on CI to catch syntax errors.
 
-## Architecture: pr-review
+## Moved: pr-review
 
-The `pr-review` action is the main artifact and exists at two layers that must stay in sync:
-
-- `pr-review/action.yaml` — composite action. Pure bash/gh/jq/curl pipeline: validate inputs → fetch PR diff via `gh pr diff` (no checkout needed) → build prompts → call the LLM → post a sticky PR comment (identified by the `<!-- pr-review-action -->` marker, updated in place on re-runs).
-- `.github/workflows/pr-review.yaml` — reusable workflow wrapper that maps `workflow_call` inputs/secrets onto the composite action.
-
-Provider abstraction: `anthropic` (Messages API, `x-api-key` + `anthropic-version` headers, response text at `.content[] | select(.type=="text")`) vs `openai`/`openai-compatible` (Chat Completions, `Authorization: Bearer`, response at `.choices[0].message.content`). Local endpoints (Ollama/vLLM) use `openai-compatible` with a required `base-url` and optional key. When adding inputs, update both layers and the inputs table in `pr-review/README.md`.
+The `pr-review` action now lives in its own repo, [`ctrl-research/ai-reviewer`](https://github.com/ctrl-research/ai-reviewer), consumed as `ctrl-research/ai-reviewer@<X.Y.Z>`. Don't re-add it here.
 
 ## Repo Conventions
 
@@ -215,10 +210,8 @@ Relevant docs may include:
 
 ```text
 /
-├── pr-review/              # Composite action: LLM-powered PR review (action.yaml + README.md)
 ├── .github/
 │   ├── workflows/
-│   │   ├── pr-review.yaml  # Reusable workflow wrapper for pr-review
 │   │   ├── renovate.yaml   # Self-hosted Renovate runner
 │   │   └── ci.yml          # YAML validation + secret scan
 │   ├── renovate-config.js  # Renovate runtime config
